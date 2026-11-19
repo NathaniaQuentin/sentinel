@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel — autonomous stop-loss &amp; take-profit on Unichain Sepolia</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 880px; margin: 0 auto; padding: 24px; color: #111; background: #fafafa; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  .sub { color: #555; margin-bottom: 16px; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 12px 0; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 160px; }
+  label { display: block; font-size: 13px; color: #444; margin: 8px 0 4px; }
+  input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+  button { padding: 9px 16px; border: 0; border-radius: 6px; background: #111; color: #fff; cursor: pointer; margin-top: 10px; }
+  button:disabled { background: #999; cursor: default; }
+  button.secondary { background: #e8e8e8; color: #111; }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; }
+  .big { font-size: 26px; font-weight: 700; }
+  .ok { color: #0a7a2e; } .warn { color: #a15c00; } .bad { color: #b00020; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #eee; }
+  #log { white-space: pre-wrap; font-size: 13px; background: #111; color: #cfc; border-radius: 8px; padding: 12px; max-height: 220px; overflow: auto; }
+  .note { font-size: 13px; color: #555; }
+</style>
+<script src="./vendor/ethers.umd.min.js"></script>
+<!-- ethers v6 is vendored locally so the page works without a CDN. -->
+<script src="./config.js"></script>
+</head>
+<body>
+<h1>Sentinel</h1>
+<p class="sub">Autonomous stop-loss &amp; take-profit executor — a Reactive Contract on Lasna watches
+Chainlink ETH/USD on Unichain Sepolia and exits your position for you. Testnet demo:
+mock WETH / mock USDC only, no real funds.</p>
+
+<div class="card">
+  <div class="row">
+    <div><label>Wallet</label><div id="wallet">not connected</div><button id="connectBtn">Connect wallet</button></div>
+    <div><label>ETH/USD (mock oracle)</label><div class="big" id="priceMock">—</div></div>
+    <div><label>ETH/USD (Chainlink feed)</label><div class="big" id="priceReal">—</div></div>
+  </div>
+  <div class="row">
+    <div><label>Your mock WETH</label><div id="balWeth">—</div><button class="secondary" id="mintBtn" disabled>Mint 10 mock WETH</button></div>
+    <div><label>Your mock USDC</label><div id="balUsdc">—</div></div>
+    <div><label>Vault USDC reserve</label><div id="reserve">—</div></div>
+  </div>
+  <p class="note">Reactive contract (Lasna): <span class="mono" id="reactiveAddr">—</span> ·
+  balance <span id="reactiveBal">—</span> · debt <span id="reactiveDebt">—</span></p>
+</div>
+
+<div class="card">
+  <h2>Open an order</h2>
+  <div class="row">
+    <div><label>Deposit (mock WETH)</label><input id="inAmount" type="number" min="0" step="0.01" value="1"></div>
+    <div><label>Stop-loss price USD (0 = none)</label><input id="inStop" type="number" min="0" step="1" value="1700"></div>
+    <div><label>Take-profit 1 USD (0 = none, sells 50%)</label><input id="inTp1" type="number" min="0" step="1" value="1900"></div>
+    <div><label>Take-profit 2 USD (0 = none, sells rest)</label><input id="inTp2" type="number" min="0" step="1" value="2000"></div>
+    <div><label>Trailing stop, bps (0 = none, 200 = 2%)</label><input id="inTrail" type="number" min="0" step="10" value="0"></div>
+  </div>
+  <button id="orderBtn" disabled>Approve &amp; open order</button>
+  <p class="note">One order = one position. The reactive contract tracks it on Lasna; when a
+  trigger price is hit it requests a callback and the vault settles your exit in mock USDC.</p>
+</div>
+
+<div class="card">
+  <h2>Your orders</h2>
+  <table><thead><tr><th>#</th><th>Deposited</th><th>Remaining</th><th>Stop</th><th>TP1</th><th>TP2</th><th>Status</th><th></th></tr></thead>
+  <tbody id="orders"><tr><td colspan="8">Connect a wallet to load orders.</td></tr></tbody></table>
+</div>
+
+<div class="card">
+  <h2>Activity</h2>
+  <div id="log">Sentinel frontend ready. Addresses load from config.js.</div>
+</div>
+
+<p class="note">Demo disclosure: exits settle from the vault's mock-USDC reserve at the
+trigger price (no DEX liquidity on testnet). The reactive contract subscribes to both the
+mock oracle and the real Chainlink feed; the demo drives the mock oracle so a price move
+happens on cue. Contracts: <span class="mono" id="addrs"></span></p>
+
+<script>
+const C = window.SENTINEL_CONFIG;
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)","function approve(address,uint256) returns (bool)","function allowance(address,address) view returns (uint256)","function mint(address,uint256)","function decimals() view returns (uint8)"];
+const ORACLE_ABI = ["function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)"];
+const VAULT_ABI = [
+  "function openOrder(uint256,int256,int256,int256,uint256) returns (uint256)",
+  "function cancelOrder(uint256)",
+  "function orders(uint256) view returns (address,uint256,uint256,int256,int256,int256,bool)",
+  "function nextOrderId() view returns (uint256)",
+  "event OrderOpened(uint256 indexed,address indexed,uint256,int256,int256,int256,uint256)",
+  "event ExitExecuted(uint256 indexed,address indexed,uint256,uint256,uint256,uint8)",
+  "event OrderCancelled(uint256 indexed,address indexed)"
+];
+const SYSTEM_ABI = ["function debt(address) view returns (uint256)"];
+const ZERO = "0x0000000000000000000000000000000000000000";
+let provider, signer, account, vault, weth, usdc, mockOracle, realFeed;
+
+const $ = id => document.getElementById(id);
+function log(msg) { const el = $("log"); el.textContent += "\n" + msg; el.scrollTop = el.scrollHeight; }
+function fmt(x, dp=2) { return Number(ethers.formatUnits(x, 18)).toLocaleString(undefined, {maximumFractionDigits: dp}); }
+function priceFmt(p) { return "$" + Number(p / 100000000n).toLocaleString(); }
+
+async function refresh() {
+  if (!C.vault || C.vault === ZERO) { $("addrs").textContent = "contracts not deployed yet (config.js)"; return; }
+  $("addrs").textContent = "vault " + C.vault + " · reactive " + C.reactive;
+  $("reactiveAddr").textContent = C.reactive;
+  try {
+    const uni = new ethers.JsonRpcProvider(C.rpcUnichain);
+    const lasna = new ethers.JsonRpcProvider(C.rpcLasna);
+    const mock = new ethers.Contract(C.mockOracle, ORACLE_ABI, uni);
+    const real = new ethers.Contract(C.realFeed, ORACLE_ABI, uni);
+    const [, mockPrice] = await mock.latestRoundData();
+    const [, realPrice] = await real.latestRoundData();
+    $("priceMock").textContent = priceFmt(mockPrice);
+    $("priceReal").textContent = priceFmt(realPrice);
+    const usdcR = new ethers.Contract(C.mockUsdc, ERC20_ABI, uni);
+    $("reserve").textContent = fmt(await usdcR.balanceOf(C.vault)) + " mUSDC";
+    $("reactiveBal").textContent = fmt(await lasna.getBalance(C.reactive)) + " lREACT";
+    const sys = new ethers.Contract(C.systemLasna, SYSTEM_ABI, lasna);
+    $("reactiveDebt").textContent = fmt(await sys.debt(C.reactive)) + " lREACT";
+    if (account) {
+      const w = new ethers.Contract(C.mockWeth, ERC20_ABI, uni);
+      const u = new ethers.Contract(C.mockUsdc, ERC20_ABI, uni);
+      $("balWeth").textContent = fmt(await w.balanceOf(account)) + " mWETH";
+      $("balUsdc").textContent = fmt(await u.balanceOf(account)) + " mUSDC";
+      await loadOrders(uni);
+    }
+  } catch (e) { log("refresh error: " + (e.shortMessage || e.message)); }
+}
+
+async function loadOrders(uni) {
+  const v = new ethers.Contract(C.vault, VAULT_ABI, uni);
+  const next = Number(await v.nextOrderId());
+  const rows = [];
+  for (let id = 1; id < next; id++) {
+    const o = await v.orders(id);
+    if (o[0].toLowerCase() !== account.toLowerCase()) continue;
+    rows.push(`<tr><td>${id}</td><td>${fmt(o[1])}</td><td>${fmt(o[2])}</td><td>${o[3] ? priceFmt(o[3]) : "—"}</td><td>${o[4] ? priceFmt(o[4]) : "—"}</td><td>${o[5] ? priceFmt(o[5]) : "—"}</td><td>${o[6] ? '<span class="ok">open</span>' : "closed"}</td><td>${o[6] ? `<button class="secondary" onclick="cancelOrder(${id})">Cancel</button>` : ""}</td></tr>`);
+  }
+  $("orders").innerHTML = rows.length ? rows.join("") : '<tr><td colspan="8">No orders yet.</td></tr>';
+}
+
+window.cancelOrder = async function(id) {
+  try {
+    const tx = await vault.cancelOrder(id);
+    log("cancel tx: " + tx.hash);
+    await tx.wait(); log("order " + id + " cancelled, WETH refunded.");
+    await refresh();
+  } catch (e) { log("cancel error: " + (e.shortMessage || e.message)); }
+};
+
+$("connectBtn").onclick = async () => {
+  if (!window.ethereum) { log("No injected wallet found."); return; }
+  provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = await provider.getSigner();
+  account = await signer.getAddress();
+  const net = await provider.getNetwork();
+  if (Number(net.chainId) !== C.chainId) {
+    try {
+      await provider.send("wallet_switchEthereumChain", [{ chainId: "0x515" }]);
+    } catch (e) {
+      await provider.send("wallet_addEthereumChain", [{ chainId: "0x515", chainName: "Unichain Sepolia", nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 }, rpcUrls: [C.rpcUnichain], blockExplorerUrls: ["https://sepolia.uniscan.xyz"] }]);
+    }
+  }
+  vault = new ethers.Contract(C.vault, VAULT_ABI, signer);
+  weth = new ethers.Contract(C.mockWeth, ERC20_ABI, signer);
+  usdc = new ethers.Contract(C.mockUsdc, ERC20_ABI, signer);
+  $("wallet").textContent = account;
+  $("mintBtn").disabled = false;
+  $("orderBtn").disabled = false;
+  log("connected: " + account);
+  await refresh();
+};
+
+$("mintBtn").onclick = async () => {
+  try {
+    const tx = await weth.mint(account, ethers.parseEther("10"));
+    log("mint tx: " + tx.hash); await tx.wait(); log("minted 10 mock WETH.");
+    await refresh();
+  } catch (e) { log("mint error: " + (e.shortMessage || e.message)); }
+};
+
+$("orderBtn").onclick = async () => {
+  try {
+    const amount = ethers.parseEther($("inAmount").value || "0");
+    const to8 = v => BigInt(Math.round(Number(v || 0) * 1e8));
+    const stop = to8($("inStop").value), tp1 = to8($("inTp1").value), tp2 = to8($("inTp2").value);
+    const trail = BigInt($("inTrail").value || 0);
+    const allow = await weth.allowance(account, C.vault);
+    if (allow < amount) {
+      const txA = await weth.approve(C.vault, amount);
+      log("approve tx: " + txA.hash); await txA.wait();
+    }
+    const tx = await vault.openOrder(amount, stop, tp1, tp2, trail);
+    log("openOrder tx: " + tx.hash);
+    const rc = await tx.wait();
+    log("order opened in block " + rc.blockNumber + ". The reactive contract is now watching the price.");
+    await refresh();
+  } catch (e) { log("order error: " + (e.shortMessage || e.message)); }
+};
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
